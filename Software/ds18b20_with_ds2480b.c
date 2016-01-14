@@ -1,41 +1,45 @@
-//
-//	This reads data from a network of 1-Wire DS18B20 temperature
-//	sensors through a DS2480B serial to 1-Wire line driver.
-//
-//	This program should compile on POSIX systems:
-//
-//		% cc -Wall -O3 DS2480B.c
-//
-//
-//	Usage:
-//
-//		./a.out [/dev/ttyS2] [x]
-//
-//
-//	Optional command line parameters:
-//
-//		/dev/ttyS2 is the serial port. The default will be used if
-//		it is not on the command line. It is recognized by a leading
-//		'/' character. 
-//
-//		x is any character that is not a '/'. If present, the program
-//		will print the ROM address of a single 1-Wire device on the bus.
-//		This only works if there is only one device on the network.
-//
-//
-//	Output:
-//
-//		The unix time() followed by the temperature in C to stdout.
-//		This repeats forever with the interval controlled by the
-//		sleep() in main().
-//
-//
-//	Program #defines:
-//
-//		o The default serial port
-//		o The number of sensors on the network
-//		o The ROM address of each sensor
-//		
+/*-----------------------------------------------------------------------------
+
+	Read data from a network of 1-Wire DS18B20 temperature
+	sensors through a DS2480B serial to 1-Wire line driver.
+
+	Compile on POSIX systems:
+
+		% cc -Wall -O3 ds18b20_with_ds2480b.c
+
+
+	Usage:
+
+		./a.out [/dev/ttyS2] [x]
+
+
+	Optional command line parameters:
+
+		/dev/ttyS2 is the serial port. The default /dev/ttyS2 will
+		be used if it is not on the command line. It is recognized
+		by a leading '/' character. 
+
+		x is any character that is not a '/'. If present, the program
+		will print the ROM address of a single 1-Wire device on the bus.
+		This only works if there is only one device on the network.
+
+
+	Output:
+
+		The unix time() followed by the temperature in C to stdout.
+		This repeats forever with the interval controlled by the
+		sleep() in main().
+
+
+	Program #defines:
+
+		o The default serial port
+		o The number of sensors on the network
+		o The ROM address of each sensor
+		
+	2015-10-08 au
+
+------------------------------------------------------------------------------*/
 
 #include <stdio.h>
 #include <string.h>
@@ -43,10 +47,9 @@
 #include <termios.h>
 #include <unistd.h>
 #include <time.h>
-//#include <sys/select.h>
 #include <stdlib.h>
 
-#define msleep(t)	usleep(1000*t)
+#define msleep(t)	usleep(1000*t)	// millseconds
 
 // DS2480B and DS18B20 commands
 #define COMMANDMODE	0xE3
@@ -55,7 +58,7 @@
 #define MATCHROM	0x55
 #define READROM		0x33
 #define READSCRATCHPAD	0xBE
-#define RESETCOMMAND	0xC5
+#define RESETCOMMAND	0xC5		// DS2480B flex speed reset
 #define SKIPROM		0xCC
 
 // Function prototypes
@@ -248,7 +251,8 @@ void ds2480b_dataMode(int fd)
 	int ds2480b_detect(fd) - initialize the DS2480B interface
 
 	Resets the DS2480B and loads configuration parameters. We're
-	using mostly defaults for mid-sized networks here.
+	using mostly defaults for mid-sized networks here. See p4 of
+	AN192.
 
 ------------------------------------------------------------------------------*/
 
@@ -273,8 +277,6 @@ int ds2480b_detect(fd)
 		fprintf(stderr, "ds2480b_detect: reset failed\n");
 		exit(0);
 	}
-//fprintf(stderr, "reset done\n");
-//fflush(stderr);
 
 	n = write(fd, tbuf, 5);
 	msleep(50);		// minimum by experiment is 10 ms
@@ -426,13 +428,13 @@ int ds2480b_reset(int fd)
 	int n;
 
 	tbuf[0] = COMMANDMODE;
-	tbuf[1] = RESETCOMMAND;
+	tbuf[1] = RESETCOMMAND;		// timing byte
 
 	n = write(fd, tbuf, 2);
 	msleep(50);			// see page 16 of the DS2480B data sheet
 
 	if (n != 2) {
-		fprintf(stderr, "ds2480b_reset: failed write on 1-Wire reset command\n");
+		fprintf(stderr, "ds2480b_reset: failed 1-Wire reset command\n");
 		return(-1);
 	}
 	n = read(fd, tbuf, 2);
@@ -507,6 +509,7 @@ int serialBreak(int fd)
 	serialSetup(int argc, char* argv[]) - Get serial port file descriptor
 
 	Assumes a command line argument starting with '/' is a port name.
+	Returns the file descriptor or exits.
 
 ------------------------------------------------------------------------------*/
 
@@ -518,6 +521,7 @@ int serialSetup(int argc, char* argv[])
 	struct termios tty_attrib;
 
 	strcpy(portName, DEFAULTSERIAL);
+
 	for (i = 1; i < argc; i++) {
 		if (argv[i][0] == '/') {
 			strcpy(portName, argv[1]);
@@ -525,6 +529,7 @@ int serialSetup(int argc, char* argv[])
 	}
 
 	fd = open(portName, O_RDWR | O_NOCTTY | O_NDELAY);
+
 	if (fd < 0) {
 		fprintf(stderr, "serialSetup: can't open serial port %s\n", portName);
 		exit(0);
