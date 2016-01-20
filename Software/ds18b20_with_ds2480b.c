@@ -1,538 +1,131 @@
-/*-----------------------------------------------------------------------------
-
-	Read data from a network of 1-Wire DS18B20 temperature
-	sensors through a DS2480B serial to 1-Wire line driver.
-
-	Compile on POSIX systems:
-
-		% cc -Wall -O3 ds18b20_with_ds2480b.c
-
-
-	Usage:
-
-		./a.out [/dev/ttyS2] [x]
-
-
-	Optional command line parameters:
-
-		/dev/ttyS2 is the serial port. The default /dev/ttyS2 will
-		be used if it is not on the command line. It is recognized
-		by a leading '/' character. 
-
-		x is any character that is not a '/'. If present, the program
-		will print the ROM address of a single 1-Wire device on the bus.
-		This only works if there is only one device on the network.
-
-
-	Output:
-
-		The unix time() followed by the temperature in C to stdout.
-		This repeats forever with the interval controlled by the
-		sleep() in main().
-
-
-	Program #defines:
-
-		o The default serial port
-		o The number of sensors on the network
-		o The ROM address of each sensor
-		
-	2015-10-08 au
-
-------------------------------------------------------------------------------*/
-
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <termios.h>
 #include <unistd.h>
-#include <time.h>
-#include <stdlib.h>
 
-#define msleep(t)	usleep(1000*t)	// millseconds
-
-// DS2480B and DS18B20 commands
+#define	msleep(t)	usleep(1000*t)	// Milliseconds sleep
 #define COMMANDMODE	0xE3
 #define CONVERT		0x44
 #define DATAMODE	0xE1
+#define DEFAULTSERIAL	"/dev/ttyS2"	// For Cygwin, Raspberry PI
 #define MATCHROM	0x55
 #define READROM		0x33
 #define READSCRATCHPAD	0xBE
 #define RESETCOMMAND	0xC5		// DS2480B flex speed reset
 #define SKIPROM		0xCC
+#define TIMINGBYTE	0xC1
+#define TRUE		1
+#define FALSE		0
 
-// Function prototypes
+// Globals
+uint8_t currentMode;
+
+// Function Prototypes
 int ds18b20_convert(int);
 float ds18b20_readTemperature(int);
-void ds2480b_dataMode(int);
 int ds2480b_detect(int);
-int ds2480b_matchROM(int, uint8_t *);
-int ds2480b_readROM(int, uint8_t *);
+int ds2480b_matchROM(int, uint8_t*);
+int ds2480b_mode(int, uint8_t);
+int ds2480b_readROM(int, uint8_t*);
+int ds2480b_recv(int, uint8_t*, int);
 int ds2480b_reset(int);
+int ds2480b_send(int, uint8_t*, int);
 int ds2480b_skipROM(int);
-int serialBreak(int);
-int serialSetup(int, char**);
-
-
-/*-------------- Change these to match your situation ------------------------*/
-
-#define DEFAULTSERIAL	"/dev/ttyS2"
-#define NSENSORS	1
-uint8_t sensor[NSENSORS][8] = {
-	{ 0x28, 0x1A, 0x82, 0xC3, 0x06, 0x00, 0x00, 0xA2 },
-//	{ 0x28, 0x38, 0xCA, 0x95, 0x06, 0x00, 0x00, 0x7C },
-//	{ 0x28, 0x42, 0xDE, 0x94, 0x06, 0x00, 0x00, 0xC7 },
-//	{ 0x28, 0xE3, 0xD1, 0x95, 0x06, 0x00, 0x00, 0x4C },
-//	{ 0x28, 0x46, 0xC9, 0x94, 0x06, 0x00, 0x00, 0x36 },
-//	{ 0x28, 0x89, 0x80, 0x95, 0x06, 0x00, 0x00, 0x18 },
-};
-
-/*----------------------------------------------------------------------------*/
+int initialize(int, char**);
+int serialInit(char*);
+int main(int, char**);
+void serialBreak(int);
 
 int main(int argc, char *argv[])
 {
 
 	uint8_t addr[8];
-	int i, get_addr, fd;
-	float C, F;
+	int i, fd, temp;
+	float Celsius, Fahrenheit;
 
-	get_addr = 0;
-	fd = serialSetup(argc, argv);
-	for (i = 1; i < argc; i++) {
-		if (argv[i][0] != '/') {
-			get_addr = 1;
-		}
-	}
-	
-	ds2480b_detect(fd);
+	fd = initialize(argc, argv);	// The serial port
 
-	if (get_addr) {
-		ds2480b_readROM(fd, addr);
-		exit(0);
-	}
+//	ds2480b_readROM(fd, addr);
 
+	ds2480b_skipROM(fd);		// Temperature conversion
+	ds18b20_convert(fd);		// for all DS18B20 devices
+
+	/* Read 1-Wire addresses from stdin and print temperatures */
 	for (;;) {
-		ds2480b_skipROM(fd);
-		ds18b20_convert(fd);
-		printf("%d ", (int) time(NULL));
-		for (i = 0; i < NSENSORS; i++) {
-			ds2480b_matchROM(fd, sensor[i]);
-			C = ds18b20_readTemperature(fd);
-			F = 32.0 + (9.0 * C/5.0);
-			printf("%6.2f %6.2f", C, F);
+		for (i = 0; i < 8; i++) {
+			if (scanf("%x", &temp) == EOF) {
+				return(1);
+			}
+			addr[i] = (uint8_t) temp;
 		}
-		printf("\n");
-		fflush(stdout);
-		sleep(58);
-	}
-
-	close(fd);
-	return(0);
-
-}
-
-/*------------------------------------------------------------------------------
-
-	int ds18b20_convert(fd) - send convert command to DS18B20
-	The convert command tells the DS18B20 temperature sensor to
-	measure the temperature and convert the value to a digital
-	12-bit number. fd is the serial port file descriptor.
-
-	DS2480B serial interface must be in data mode upon entry.
-	Exits with DS2480B in data mode.
-
-------------------------------------------------------------------------------*/
-
-int ds18b20_convert(int fd)
-{
-
-	uint8_t tbuf[3];
-	int n;
-
-	tbuf[0] = CONVERT;
-
-	n = write(fd, tbuf, 1);
-	msleep(50);
-
-	if (n != 1) {
-		fprintf(stderr, "ds18b20_convert: error writing convert command\n");
-		fflush(stderr);
-		exit(0);
-	}
-
-	msleep(750);	// wait for 12-bit conversion
-	tbuf[0] = 0xFF;
-	n = read(fd, tbuf, 1);
-	if ((n != 1) || (tbuf[0] != CONVERT)) {
-		fprintf(stderr, "ds18b20_convert: read-back error\n");
-		fflush(stderr);
-		exit(0);
-	}
-
-	tcflush(fd, TCIOFLUSH);
-	msleep(50);
-
-	return(0);
-
-}
-
-/*------------------------------------------------------------------------------
-
-	float ds18b20_readTemperature(fd) - returns temperature
-	Reads the DS18B20 scratchpad for a 12-bit number, then converts to C.
-
-	Do a ds2480b_matchROM or ds2480b_skipROM first.
-
-------------------------------------------------------------------------------*/
-
-float ds18b20_readTemperature(int fd)
-{
-
-	uint8_t tbuf[10], scratch[10];
-	int i, n, len, Celsius;
-
-	len = 0;
-	tbuf[len++] = READSCRATCHPAD;
-	for (i = 0; i < 9; i++) {
-		tbuf[len++] = 0xFF;
-	}
-	n = write(fd, tbuf, len);
-	msleep(50);
-
-	if (n != len) {
-		fprintf(stderr, "ds18b20_readTemperature: error writing command to DS2480B\n");
-		exit(0);
-	}
-
-	n = read(fd, scratch, len);
-	if (n != len) {
-		fprintf(stderr, "ds18b20_readTemperature: error writing command to DS2480B\n");
-		exit(0);
-	}
-
-	Celsius = scratch[2];
-	Celsius <<= 8;
-	Celsius |= scratch[1];
-
-	tcflush(fd, TCIOFLUSH);
-	msleep(50);
-
-	return(Celsius * 0.0625);
-
-}
-
-/*------------------------------------------------------------------------------
-
-	ds2480b_dataMode(fd) - puts the DS2480B line driver into data mode
-
-------------------------------------------------------------------------------*/
-
-void ds2480b_dataMode(int fd)
-{
-
-	uint8_t tbuf;
-	int n;
-
-	tbuf = DATAMODE;
-
-	n = write(fd, &tbuf, 1);
-	if (n != 1) {
-		fprintf(stderr, "ds2480b_dataMode: error writing DATAMODE request\n");
-		fflush(stdout);
-		exit(0);
-	}
-
-	return;
-
-}
-
-/*------------------------------------------------------------------------------
-
-	int ds2480b_detect(fd) - initialize the DS2480B interface
-
-	Resets the DS2480B and loads configuration parameters. We're
-	using mostly defaults for mid-sized networks here. See p4 of
-	AN192.
-
-------------------------------------------------------------------------------*/
-
-int ds2480b_detect(fd)
-{
-
-	uint8_t tbuf[6], response[] = {0x16, 0x44, 0x5A, 0x00, 0x93};
-	int i, n;
-
-	tbuf[0] = 0x17;		// Pull-down slew rate control (PDSRC) 1.35V/us
-	tbuf[1] = 0x45;		// Write-1 low time 10 us (W1LT aka WILD)
-	tbuf[2] = 0x5B;		// DSO/WORT 8 us
-	tbuf[3] = 0x0F;		// Read baud rate request
-	tbuf[4] = 0x91;		// 1-Wire bit result
-
-	if (serialBreak(fd) != 0) {
-		exit(0);
-	}
-
-	n = ds2480b_reset(fd);
-	if ((n != 0xCD) & (n != 0xE3)) {
-		fprintf(stderr, "ds2480b_detect: reset failed\n");
-		exit(0);
-	}
-
-	n = write(fd, tbuf, 5);
-	msleep(50);		// minimum by experiment is 10 ms
-
-	if (n != 5) {
-		fprintf(stderr, "ds2480b_detect: error writing configuration parameters\n");
-		exit(0);
-	}
-
-	n = read(fd, tbuf, 5);
-	if (n != 5) {
-		fprintf(stderr, "ds2480b_detect: error reading back configuration parameters\n");
-		exit(0);
-	}
-	for (i = 0; i < 5; i++) {
-		if (tbuf[i] != response[i]) {
-			fprintf(stderr, "ds2480b_detect: config parameter read-back error\n");
-			exit(0);
+		printf("DS18B20 address [ ");
+		for (i = 0; i < 8; i++) {
+			printf("%02X ", addr[i]);
 		}
+		printf("] ");
+		ds2480b_matchROM(fd, addr);
+		Celsius = ds18b20_readTemperature(fd);
+		Fahrenheit = 32.0 + 9.0 * Celsius / 5.0;
+		printf("T = %6.2fC %5.1fF\n", Celsius, Fahrenheit);
 	}
-	tcflush(fd, TCIOFLUSH);
-	msleep(50);
-	return(0);
+	exit(0);
 
 }
 
 /*------------------------------------------------------------------------------
 
-	ds2480b_matchROM(int fd, uint8_t *addr) - select a 1-Wire device
+	int initialize(argc, argv)
 
-	Select the 1-Wire slave with the matching ROM address.
-
-------------------------------------------------------------------------------*/
-
-int ds2480b_matchROM(int fd, uint8_t *addr)
-{
-
-	uint8_t tbuf[18];
-	int i, n, len;
-
-	ds2480b_reset(fd);
-	ds2480b_dataMode(fd);
-
-	len = 0;
-	tbuf[len++] = MATCHROM;
-	for (i = 0; i < 8; i++) {
-		tbuf[len++] = addr[i];
-		if (tbuf[len-1] == COMMANDMODE) {
-			tbuf[len++] = COMMANDMODE;
-		}
-	}
-
-	n = write(fd, tbuf, len);
-	msleep(50);
-	if (n != len) {
-		fprintf(stderr, "ds2480b_matchROM: error writing MATCHROM command\n");
-		fflush(stderr);
-		exit(0);
-	}
-
-	n = read(fd, tbuf, 9);
-	if (n != 9) {
-		fprintf(stderr, "ds2480b_matchROM: error reading reply from DS2480B\n");
-		fflush(stderr);
-		exit(0);
-	}
-
-	tcflush(fd, TCIFLUSH);
-	msleep(50);
-
-	return(0);
-
-}
-
-/*------------------------------------------------------------------------------
-
-	ds2480b_readROM(fd, *addr) - reads the ROM address of a 1-Wire device
-
-	Only one device on the network.
+	Open the serial port. The DEFAULTSERIAL port is used unless a port
+	is named on the command line (anything with a leading '/' will be
+	interpreted as a serial port).
 
 ------------------------------------------------------------------------------*/
-
-int ds2480b_readROM(int fd, uint8_t *addr)
-{
-
-	uint8_t tbuf[10];
-	int i, n, len;
-
-	ds2480b_reset(fd);
-	ds2480b_dataMode(fd);
-
-	len = 0;
-	tbuf[len++] = READROM;
-	for (i = 1; i < 10; i++) {
-		tbuf[len++] = 0xFF;
-	}
-
-	n = write(fd, tbuf, len);
-	msleep(50);
-	if (n != len) {
-		fprintf(stderr, "ds2480b_readROM: error writing READROM request\n");
-		fflush(stderr);
-		return(-1);
-	}
-
-	n = read(fd, addr, 10);
-	if (n != 10) {
-		fprintf(stderr, "ds2480b_readROM: error reading ROM address\n");
-		fflush(stdout);
-		tcflush(fd, TCIOFLUSH);
-		msleep(50);
-		return(-1);
-	}
-
-	for (i = 0; i < 9; i++) {
-		addr[i] = addr[i+1];
-	}
-	printf("ROM address is [ ");
-	for (i = 0; i < 8; i++) {
-		printf("%02X ", addr[i]);
-	}
-	printf("]\n");
-	fflush(stdout);
-
-	tcflush(fd, TCIOFLUSH);
-	msleep(50);
-
-	return(0);
-
-}
-
-/*------------------------------------------------------------------------------
-
-	int ds2480b_reset(fd) - resets the 1-Wire bus and leaves DS2480B in command mode
-
-	returns:
-		0xE3 - no reply from DS2480B (this happens after sending a BREAK)
-		0xCC - 1-Wire bus shorted
-		0xCD - Device presence detected
-		0xCE - Alarm received
-		0xCF - No 1-Wire device presence
-
-------------------------------------------------------------------------------*/
-
-int ds2480b_reset(int fd)
-{
-
-	uint8_t tbuf[2];
-	int n;
-
-	tbuf[0] = COMMANDMODE;
-	tbuf[1] = RESETCOMMAND;		// timing byte
-
-	n = write(fd, tbuf, 2);
-	msleep(50);			// see page 16 of the DS2480B data sheet
-
-	if (n != 2) {
-		fprintf(stderr, "ds2480b_reset: failed 1-Wire reset command\n");
-		return(-1);
-	}
-	n = read(fd, tbuf, 2);
-	if ((tbuf[0] != 0xCD) && (tbuf[0] != 0xE3)) {
-		fprintf(stderr, "ds2480b_reset: abnormal 1-Wire reply is %02X\n", tbuf[0]);
-		fflush(stderr);
-	}
-	tcflush(fd, TCIOFLUSH);
-	msleep(50);
-	return(tbuf[0]);
-
-}
-
-/*------------------------------------------------------------------------------
-
-	ds2480b_skipROM(int fd) - use to send a command to all 1-Wire devices
-
-------------------------------------------------------------------------------*/
-
-int ds2480b_skipROM(int fd)
-{
-
-	uint8_t tbuf[1];
-	int n;
-
-	ds2480b_reset(fd);
-	ds2480b_dataMode(fd);
-
-	tbuf[0] = SKIPROM;
-	n = write(fd, tbuf, 1);
-	msleep(50);
-	if (n != 1) {
-		fprintf(stderr, "ds2480b_skipROM: error writing SKIPROM request\n");
-		fflush(stderr);
-		exit(0);
-	}
-
-	n = read(fd, tbuf, 1);
-	if (n != 1) {
-		fprintf(stderr, "ds2480b_skipROM: error in read-back\n");
-		fflush(stderr);
-		exit(0);
-	}
-	tcflush(fd, TCIOFLUSH);
-	msleep(50);
-	return(0);
-
-}
-
-/*------------------------------------------------------------------------------
-
-	ds2480b_serialBreak(int fd) - Send a BREAK to the DS2480B line driver
-
-	This resets the DS2480B to its power-up state.
-
-------------------------------------------------------------------------------*/
-
-int serialBreak(int fd)
-{
-
-	if (tcsendbreak(fd, 0) != 0) {
-		fprintf(stderr, "serialBreak: tcsendbreak(fd, 0) failed\n");
-		fflush(stderr);
-		return(-1);
-	} else {
-		return(0);
-	}
-}
-
-/*------------------------------------------------------------------------------
-
-	serialSetup(int argc, char* argv[]) - Get serial port file descriptor
-
-	Assumes a command line argument starting with '/' is a port name.
-	Returns the file descriptor or exits.
-
-------------------------------------------------------------------------------*/
-
-int serialSetup(int argc, char* argv[])
+int initialize(int argc, char *argv[])
 {
 
 	char portName[25];
-	int i, fd, flags;
-	struct termios tty_attrib;
+	int i, fd;
 
 	strcpy(portName, DEFAULTSERIAL);
-
 	for (i = 1; i < argc; i++) {
 		if (argv[i][0] == '/') {
 			strcpy(portName, argv[1]);
-		}
+		}	
 	}
 
-	fd = open(portName, O_RDWR | O_NOCTTY | O_NDELAY);
+	fd = serialInit(portName);	// Open the serial port
 
+	if (ds2480b_detect(fd) == -1) {
+		fprintf(stderr, "initialize: first ds2480b_detect failed\n");
+		msleep(100);
+		ds2480b_detect(fd);
+	}
+
+	return(fd);
+
+}
+
+/*------------------------------------------------------------------------------
+
+	int serialInit("/dev/ttyS2")
+
+	Set the serial port to 9600 baud, non-blocking, and return the file
+	descriptor.
+
+------------------------------------------------------------------------------*/
+int serialInit(char *portName)
+{
+
+	int fd, flags;
+	struct termios tty_attrib;
+
+	fd = open(portName, O_RDWR | O_NOCTTY | O_NDELAY);
 	if (fd < 0) {
-		fprintf(stderr, "serialSetup: can't open serial port %s\n", portName);
-		exit(0);
+		fprintf(stderr, "initialize: can't open serial port %s\n", portName);	
+		exit(1);
 	}
 
 	flags = fcntl(fd, F_GETFL);		// retrieve access mode and status flags
@@ -547,3 +140,436 @@ int serialSetup(int argc, char* argv[])
 	return(fd);
 
 }
+
+/*------------------------------------------------------------------------------
+
+	void serialBreak(fd)
+
+	Send a break out the serial port connected to fd.
+
+------------------------------------------------------------------------------*/
+void serialBreak(int fd)
+{
+
+	if (tcsendbreak(fd, 0) != 0) {
+		fprintf(stderr, "serialBreak: tcsendbreak failed\n");
+		exit(1);
+	}
+
+}
+
+/*------------------------------------------------------------------------------
+
+	ds2480b_detect(fd)
+
+	Sets up the DS2480B timing and pulses.
+	Leaves it in Command mode.
+
+	The last byte in the response is supposed to be 93 but it sometimes
+	comes back as 90. The explanation in AN192 suggests that the discrepancy
+	is due to unsolicited presence pulses and is OK.
+
+------------------------------------------------------------------------------*/
+int ds2480b_detect(fd)
+{
+
+	uint8_t i, n, tbuf[6], response[] = {0x16, 0x44, 0x5A, 0x00, 0x93};
+
+	serialBreak(fd);
+	tbuf[0] = TIMINGBYTE;
+	ds2480b_send(fd, tbuf, 1);	// Send the timing byte
+
+					// Pulse shaping & detect: See p4 & p5 of AN192
+	tbuf[0] = 0x17;			// Pull-down slew rate (PDSRC) 1.37V/us
+	tbuf[1] = 0x45;			// Write-w low time 10 us (W1LT or W1LD)
+	tbuf[2] = 0x5B;			// DSO/WORT 8 us
+	tbuf[3] = 0x0F;			// Read baud rate register command request
+	tbuf[4] = 0x91;			// 1-Wire bit result
+
+	n = ds2480b_send(fd, tbuf, 5);
+	if (n == -1) {
+		fprintf(stderr, "ds2480b_detect: error sending pulse shape parameters\n");
+		exit(1);
+	}
+
+	n = ds2480b_recv(fd, tbuf, 5);
+	if (n == -1) {
+		fprintf(stderr, "ds2480b_detect: error receiving response packet\n");
+		exit(1);
+	}
+	for (i = 0; i < 5; i++) {
+		if (tbuf[i] != response[i]) {
+			if (i < 4) {
+				fprintf(stderr, "ds2480b_detect: bad response packet\n");
+				fprintf(stderr, "tbuf[%d] = %02X should be %02X\n", i, tbuf[i], response[i]);
+				return(-1);
+			} else {
+				if (tbuf[i] != 0x90) {		// 0x90 is OK (AN192 p4)
+					fprintf(stderr, "ds2480b_detect: bad response packet\n");
+					fprintf(stderr, "tbuf[%d] = %02X should be 0x90 or 0x93\n", i, tbuf[i]);
+					return(-1);
+				}
+			}
+		}
+	}
+	currentMode = COMMANDMODE;
+	return(0);
+}
+
+/*------------------------------------------------------------------------------
+
+	ds2480b_matchROM(fd, addr)		NOT FINISHED
+
+	Sends the match ROM command for addr
+
+------------------------------------------------------------------------------*/
+int ds2480b_matchROM(int fd, uint8_t *addr)
+{
+
+	uint8_t tbuf[9];
+	int i, n;
+
+	ds2480b_reset(fd);
+	ds2480b_mode(fd, DATAMODE);
+	tbuf[0] = MATCHROM;
+	for (i = 1; i < 9; i++) {
+		tbuf[i] = addr[i-1];
+	}
+
+	n = ds2480b_send(fd, tbuf, 9);
+	if (n == -1) {
+		fprintf(stderr, "ds2480b_matchROM: error sending MATCHROM command\n");
+		return(-1);
+	}
+
+	n = ds2480b_recv(fd, tbuf, 9);
+	if (n != 9) {
+		fprintf(stderr, "ds2480b_matchROM: error reading reply from DS2480B\n");
+		return(-1);
+	}
+	return(0);
+
+}
+
+/*------------------------------------------------------------------------------
+
+	ds2480b_mode(fd, mode)
+
+	Set the DS2480B mode and the global currentMode flag.
+
+------------------------------------------------------------------------------*/
+int ds2480b_mode(int fd, uint8_t mode)
+{
+
+	uint8_t tbuf[1];
+	int n;
+
+	if (currentMode == mode) {
+		return(0);
+	}
+
+	tbuf[0] = mode;
+
+	n = ds2480b_send(fd, tbuf, 1);
+	if (n == -1) {
+		fprintf(stderr, "ds2480b_mode: error sending mode change command\n");
+		return(-1);
+	}
+
+	currentMode = mode;
+
+//	msleep(50);		// Minimum time by experiment is around 10ms
+	return(0);
+
+}
+
+/*------------------------------------------------------------------------------
+
+	ds2480b_reset(fd)
+
+	Reset the 1-Wire bus and report wire irregularities.
+
+	The DS2480B returns a 1 byte response:
+
+	11xvvvrr where:
+		x	- undefined bit
+		vvv	- DS2480 version
+			- 010 means DS2480
+			- 011 means DS2480B
+		rr	- 00 shorted
+			- 01 presence detected (OK)
+			- 10 alarm detected
+			- 11 no presence detected
+
+	A good response is 0xCD
+
+------------------------------------------------------------------------------*/
+int ds2480b_reset(int fd)
+{
+
+	uint8_t tbuf[2];
+	int n;
+
+	if (currentMode == DATAMODE) {
+		ds2480b_mode(fd, COMMANDMODE);
+	}
+	tbuf[0] = RESETCOMMAND;
+	n = ds2480b_send(fd, tbuf, 1);
+	if (n == -1) {
+		fprintf(stderr, "ds2480b_reset: error sending 1-Wire RESET to DS2480B\n");
+		return(-1);
+	}
+
+//	msleep(50);			// See p16 of the DS2480B datasheet (could be shorter?)
+
+	n = ds2480b_recv(fd, tbuf, 1);
+
+	if (tbuf[0] != 0xCD) {
+		fprintf(stderr, "ds2480b_reset: 1-Wire ");
+		n = (tbuf[0] & 0x03);
+		switch (n) {
+		case 0:
+			fprintf(stderr, "shorted\n");
+			return(-1);
+		case 2:
+			fprintf(stderr, "alarm\n");
+			return(-1);
+		case 3:
+			fprintf(stderr, "devices not present\n");
+			return(-1);
+		default:
+			fprintf(stderr, "unknown response [%0x]", tbuf[0]);
+			return(-1);
+		}
+	}
+	return(0);
+
+}
+
+/*------------------------------------------------------------------------------
+
+	ds2480b_readROM(fd, addr)
+
+	Read the ROM address of a single 1-Wire device on the bus.
+
+------------------------------------------------------------------------------*/
+int ds2480b_readROM(int fd, uint8_t *addr)
+{
+
+	int i, n;
+	uint8_t tbuf[9];
+
+	ds2480b_reset(fd);
+	ds2480b_mode(fd, DATAMODE);
+
+	tbuf[0] = READROM;
+	for (i = 1; i < 9; i++) {
+		tbuf[i] = 0xFF;
+	}
+
+	n = ds2480b_send(fd, tbuf, 9);
+	if (n == -1) {
+		fprintf(stderr, "ds2480b_readROM: error sending readROM command\n");
+		return(-1);
+	}
+//	msleep(50);				// ?? should experiment here
+
+	n = ds2480b_recv(fd, tbuf, 9);
+	if (n == -1) {
+		fprintf(stderr, "ds2480b_readROM: error receiving ROM address\n");
+		return(-1);
+	}
+	ds2480b_mode(fd, DATAMODE);
+	ds2480b_reset(fd);			// ERROR HERE?
+
+	for (i = 0; i < 8; i++) {
+		addr[i] = tbuf[i+1];
+	}
+	for (i = 0; i < 8; i++) {
+		printf("%02X ", addr[i]);
+	}
+	printf("\n");
+	return(0);
+}
+
+/*------------------------------------------------------------------------------
+
+	ds2480b_recv(fd, tbuf, nbytes)
+
+	Receive a stream of bytes from the serial port
+
+------------------------------------------------------------------------------*/
+int ds2480b_recv(int fd, uint8_t *tbuf, int nbytes)
+{
+
+	int n;
+
+	msleep(50);
+	n = read(fd, tbuf, nbytes);
+	if (n != nbytes) {
+		fprintf(stderr, "ds2480b_recv: read from serial port failed\n");
+		return(-1);
+	}
+	tcflush(fd, TCIOFLUSH);			// flush read and write data
+	return(n);
+
+}
+
+/*------------------------------------------------------------------------------
+
+	ds2480b_send(fd, data, nbytes)
+
+	Send a stream of bytes out the serial port.
+
+------------------------------------------------------------------------------*/
+int ds2480b_send(int fd, uint8_t *data, int nbytes)
+{
+
+	uint8_t tbuf[25];
+	int i, n, len;
+
+	tcflush(fd, TCIOFLUSH);			// flush read and write data
+
+	len = 0;
+	for (i = 0; i < nbytes; i++) {
+		tbuf[len] = data[i];
+		if (tbuf[len] == COMMANDMODE) {
+			len++;
+			tbuf[len] = COMMANDMODE;
+		}
+		len++;
+	}
+
+	nbytes = len;
+	n = write(fd, data, nbytes);
+	if (n != nbytes) {
+		fprintf(stderr, "ds2480b_send: write to serial port failed\n");
+		return(-1);
+	}
+	msleep(50);
+
+	return(0);
+
+}
+
+/*------------------------------------------------------------------------------
+
+	ds2480b_skipROM(fd)
+
+	Sends the skip ROM command.
+
+------------------------------------------------------------------------------*/
+int ds2480b_skipROM(int fd)
+{
+
+	uint8_t tbuf[1];
+	int n;
+
+	ds2480b_reset(fd);
+	n = ds2480b_mode(fd, DATAMODE);
+	if (n != 0) {
+		fprintf(stderr, "ds2480b_skipROM: error reported from ds2480b_mode\n");
+		return(-1);
+	}
+	tbuf[0] = SKIPROM;
+	n = ds2480b_send(fd, tbuf, 1);
+	if (n == -1) {
+		fprintf(stderr, "ds2480b_skipROM: error reported from ds2480b_send\n");
+		return(-1);
+	}
+	n = ds2480b_recv(fd, tbuf, 1);
+	if (n != 1) {
+		fprintf(stderr, "ds2480b_skipROM: error reported from ds2480b_recv\n");
+		return(-1);
+	}
+	if (tbuf[0] != SKIPROM) {
+		fprintf(stderr, "ds2480b_skipROM: reply error from DS2480B\n");
+		return(-1);
+	}
+	return(0);
+
+}
+
+/*------------------------------------------------------------------------------
+
+	ds18b20_convert(fd)
+
+	Send the convert command (0x44) to the DS18B20 sensor and read
+	back the reply from the DS2480B bridge.
+
+------------------------------------------------------------------------------*/
+int ds18b20_convert(int fd)
+{
+
+	uint8_t tbuf[3];
+	int n;
+	
+	ds2480b_mode(fd, DATAMODE);
+
+	tbuf[0] = CONVERT;
+	n = ds2480b_send(fd, tbuf, 1);
+	if (n == -1) {
+		fprintf(stderr, "ds18b20_convert: error sending convert command\n");
+		return(-1);
+	}
+	msleep(750);		// 12-bit conversion time
+
+	n = ds2480b_recv(fd, tbuf, 1);
+	if (n != 1) {
+		fprintf(stderr, "ds18b20_convert: error receiving convert command confirmation\n");
+		return(-1);
+	}
+
+	if (tbuf[0] != CONVERT) {
+		fprintf(stderr, "ds18b20_convert: read-back error from DS2480B\n");
+		return(-1);
+	}
+
+	return(0);
+
+}
+
+
+/*------------------------------------------------------------------------------
+
+	ds18b20_readTemperature(fd)
+
+	Returns the floating point value. Do a matchROM or skipROM first.
+
+------------------------------------------------------------------------------*/
+float ds18b20_readTemperature(int fd)
+{
+
+	uint8_t tbuf[9];
+	int i, n, C;
+
+	ds2480b_mode(fd, DATAMODE);
+
+	tbuf[0] = READSCRATCHPAD;
+	for (i = 1; i < 9; i++) {
+		tbuf[i] = 0xFF;
+	}
+
+	n = ds2480b_send(fd, tbuf, 9);
+	if (n == -1) {
+		fprintf(stderr, "ds2480b_readTemperature: error sending READSCRATCHPAD command\n");
+		return(-1);
+	}
+
+	n = ds2480b_recv(fd, tbuf, 9);
+	if (n == -1) {
+		fprintf(stderr, "ds2480b_readTemperature: error receiving scratchpad data\n");
+		return(-1);
+	}
+
+	C = tbuf[2];
+	C = C << 8;
+	C += tbuf[1];
+	return((float) C * 0.0625);
+
+}
+
+/*------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------*/
+
