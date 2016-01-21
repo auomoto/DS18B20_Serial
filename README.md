@@ -1,1 +1,2 @@
-# Reading DS18B20 Sensors through a serial port
+# Read DS18B20 Sensors through a serial port
+We read a string of DS18B20 1-Wire temperature sensors using a DS2480B serial-to-1-Wire line driver. Our board also uses a MAX233 RS-232 chip to interface with true RS-232.
