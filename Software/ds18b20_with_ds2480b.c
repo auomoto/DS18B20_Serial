@@ -5,7 +5,7 @@
 #include <termios.h>
 #include <unistd.h>
 
-#define DEFAULTSERIAL	"/dev/ttyS2"	// For Cygwin, Raspberry PI
+#define DEFAULTSERIAL	"/dev/ttyS2"		// For Cygwin, Raspberry PI
 #define	msleep(t)	usleep(1000*t)		// Milliseconds sleep
 
 // DS2480B
@@ -18,6 +18,7 @@
 
 // 1-Wire
 #define MATCHROM	0x55
+#define MAXDEVICES	25
 #define READROM		0x33
 #define	SEARCHROM	0xF0
 #define SKIPROM		0xCC
@@ -41,7 +42,6 @@ float ds18b20_readTemperature(int);
 int ds2480b_detect(int);
 int ds2480b_matchROM(int, uint8_t*);
 int ds2480b_mode(int, uint8_t);
-void printBits(uint8_t*);
 int ds2480b_readROM(int, uint8_t*);
 int ds2480b_recv(int, uint8_t*, int);
 int ds2480b_reset(int);
@@ -50,9 +50,13 @@ int ds2480b_skipROM(int);
 void getROM(uint8_t*, uint8_t*);
 int initialize(int, char**);
 int main(int, char**);
-int OWSearch(int, int, uint8_t*);
-void OWSearchX(int, uint8_t*);
 int lastDiscrep(uint8_t*);
+void loadBuf(uint8_t*, uint8_t*);
+void parse(uint8_t*, uint8_t*);
+void prArray(uint8_t*);
+void prParsed(uint8_t*);
+void prROM(uint8_t*);
+void ds2480b_searchROM(int, uint8_t*, uint8_t*);
 void serialBreak(int);
 int serialInit(char*);
 void setDirectionBit(int, uint8_t*);
@@ -61,60 +65,60 @@ uint8_t twoIntoOne(uint8_t*);
 int main(int argc, char *argv[])
 {
 
-	uint8_t addr[8];				// 1-Wire ROM address
-	int i, fd, temp, currentTime, lastDiscrepancy;
+	uint8_t addr[8], directions[64], romAddresses[MAXDEVICES][8];
+	int i, j, nDevices, fd, lastDiscrepancy, currentTime;
 	float Celsius, Fahrenheit;
 
 	fd = initialize(argc, argv);	// Open the DS2480B serial port
-/////////
-
 	lastDiscrepancy = -1;
-
-	lastDiscrepancy = OWSearch(fd, lastDiscrepancy, addr);
-/*
-if (ds2480b_detect(fd) == -1) {
-	fprintf(stderr, "initialize: first ds2480b_detect failed\n");
-	msleep(100);
-	ds2480b_detect(fd);
-}
-*/
-	ds2480b_reset(fd);
-	lastDiscrepancy = OWSearch(fd, lastDiscrepancy, addr);
-exit(0);
-/////////
-//	ds2480b_readROM(fd, addr);
-	ds2480b_skipROM(fd);
-	currentTime = (int) time(NULL);	// POSIX time (no leap seconds)
-	ds18b20_convert(fd);			// Get temperature reading
-	for (;;) {
-		/* Read 1-Wire ROM addresses from stdin */
-		for (i = 0; i < 8; i++) {
-			if (scanf("%x", &temp) == EOF) {
-				return(1);		// unexpected EOF
-			}
-			addr[i] = (uint8_t) temp;
-		}
-		ds2480b_matchROM(fd, addr);
-		Celsius = ds18b20_readTemperature(fd);
-		Fahrenheit = 32.0 + 9.0 * Celsius / 5.0;
-		printf("%d %6.2f %5.1f [ ", currentTime, Celsius, Fahrenheit);
-		for (i = 0; i < 8; i++) {
-			printf("%02X ", addr[i]);
-		}
-		printf("]\n");
+	nDevices = 0;
+	for (i = 0; i < 64; i++) {
+		directions[i] = 0;
 	}
-	exit(0);
+	while (lastDiscrepancy) {
+		ds2480b_searchROM(fd, directions, addr);
+		for (i = 0; i < 8; i++) {
+			romAddresses[nDevices][i] = addr[i];
+		}
+		lastDiscrepancy = lastDiscrep(directions);
+		setDirectionBit(lastDiscrepancy, directions);
+		nDevices++;
+	}
+	printf("nDevices = %d\n", nDevices);
+	for (i = 0; i < nDevices; i++) {
+		prROM(romAddresses[i]);
+	}
+	for (;;) {
+		printf("---\n");
+		ds2480b_skipROM(fd);
+		currentTime = (int) time(NULL);	// POSIX time (no leap seconds)
+		ds18b20_convert(fd);			// Get temperature reading
+		for (i = 0; i < nDevices; i++) {
+			for (j = 0; j < 8; j++) {
+				addr[j] = romAddresses[i][j];
+			}
+			ds2480b_matchROM(fd, addr);
+			Celsius = ds18b20_readTemperature(fd);
+			Fahrenheit = 32.0 + 9.0 * Celsius / 5.0;
+			printf("%d %6.2f %5.1f [ ", currentTime, Celsius, Fahrenheit);
+			for (j = 0; j < 8; j++) {
+				printf("%02X ", addr[j]);
+			}
+			printf("]\n");
+			fflush(stdout);
+		}
+//		sleep(1);
+	}
+	return(0);
 
 }
 
 /*------------------------------------------------------------------------------
-
 	int initialize(argc, argv)
 
 	Open the serial port connected to the DS2480B. DEFAULTSERIAL port is used
 	unless a port is named on the command line (anything with a leading '/' will
 	be interpreted as a serial port).
-
 ------------------------------------------------------------------------------*/
 int initialize(int argc, char *argv[])
 {
@@ -139,12 +143,10 @@ int initialize(int argc, char *argv[])
 }
 
 /*------------------------------------------------------------------------------
-
 	int serialInit("/dev/ttyS2")
 
 	Set the serial port to 9600 baud, non-blocking, and return the file
 	descriptor.
-
 ------------------------------------------------------------------------------*/
 int serialInit(char *portName)
 {
@@ -170,11 +172,9 @@ int serialInit(char *portName)
 }
 
 /*------------------------------------------------------------------------------
-
 	void serialBreak(fd)
 
 	Send a break to the serial port connected to fd.
-
 ------------------------------------------------------------------------------*/
 void serialBreak(int fd)
 {
@@ -187,7 +187,82 @@ void serialBreak(int fd)
 }
 
 /*------------------------------------------------------------------------------
+	int ds18b20_convert(fd)
 
+	Send the convert command (0x44) to the DS18B20 sensor and read
+	back the reply (command echo) from the DS2480B bridge. Returns -1
+	on error. This includes the 750ms conversion time wait.
+------------------------------------------------------------------------------*/
+int ds18b20_convert(int fd)
+{
+
+	uint8_t tbuf[3];
+	int n;
+	
+	ds2480b_mode(fd, DATAMODE);
+	tbuf[0] = CONVERT;
+	n = ds2480b_send(fd, tbuf, 1);
+	if (n == -1) {
+		fprintf(stderr, "ds18b20_convert: error sending convert command\n");
+		return(-1);
+	}
+	msleep(750);		// 12-bit conversion time
+	n = ds2480b_recv(fd, tbuf, 1);
+	if (n != 1) {
+		fprintf(stderr, "ds18b20_convert: error receiving convert command confirmation\n");
+		return(-1);
+	}
+	if (tbuf[0] != CONVERT) {
+		fprintf(stderr, "ds18b20_convert: read-back error from DS2480B\n");
+		return(-1);
+	}
+	return(0);
+
+}
+
+/*------------------------------------------------------------------------------
+	float ds18b20_readTemperature(fd)
+
+	Returns the floating point value. Do a CONVERT first.
+------------------------------------------------------------------------------*/
+float ds18b20_readTemperature(int fd)
+{
+
+	uint8_t i, n, tbuf[9];
+	int C;
+	float sign;
+
+	ds2480b_mode(fd, DATAMODE);
+	tbuf[0] = READSCRATCHPAD;
+	for (i = 1; i < 9; i++) {
+		tbuf[i] = 0xFF;
+	}
+	n = ds2480b_send(fd, tbuf, 9);
+	if (n == -1) {
+		fprintf(stderr, "ds2480b_readTemperature: error sending READSCRATCHPAD command\n");
+		return(-1);
+	}
+
+	n = ds2480b_recv(fd, tbuf, 9);
+	if (n == -1) {
+		fprintf(stderr, "ds2480b_readTemperature: error receiving scratchpad data\n");
+		return(-1);
+	}
+	C = tbuf[2];
+	C = C << 8;
+	C += tbuf[1];
+	// C = 0xFE6F;		// Test value -25.00
+	if (C & 0x8000) {
+		sign = -1.0;
+		C ^= 0xFFFF;
+	} else {
+		sign = 1.0;
+	}
+	return(sign * 0.0625 * (float) C);
+
+}
+
+/*------------------------------------------------------------------------------
 	ds2480b_detect(fd)
 
 	Sets up the DS2480B timing and pulses. Leaves it in Command mode.
@@ -196,7 +271,6 @@ void serialBreak(int fd)
 	comes back as 90. The explanation in AN192 suggests that the discrepancy
 	is due to unsolicited presence pulses although that doesn't jibe with
 	Maxim demonstration code found on the web.
-
 ------------------------------------------------------------------------------*/
 int ds2480b_detect(fd)
 {
@@ -249,11 +323,9 @@ int ds2480b_detect(fd)
 }
 
 /*------------------------------------------------------------------------------
-
 	int ds2480b_matchROM(fd, addr)
 
 	Send the match ROM command
-
 ------------------------------------------------------------------------------*/
 int ds2480b_matchROM(int fd, uint8_t *addr)
 {
@@ -286,11 +358,9 @@ int ds2480b_matchROM(int fd, uint8_t *addr)
 }
 
 /*------------------------------------------------------------------------------
-
 	int ds2480b_mode(fd, mode)
 
 	Set the DS2480B mode and the global currentMode flag.
-
 ------------------------------------------------------------------------------*/
 int ds2480b_mode(int fd, uint8_t mode)
 {
@@ -313,7 +383,6 @@ int ds2480b_mode(int fd, uint8_t mode)
 }
 
 /*------------------------------------------------------------------------------
-
 	int ds2480b_reset(fd)
 
 	Reset the 1-Wire bus and report wire irregularities.
@@ -330,7 +399,6 @@ int ds2480b_mode(int fd, uint8_t mode)
 			- 11 no presence detected
 
 	A good response is 0xCD
-
 ------------------------------------------------------------------------------*/
 int ds2480b_reset(int fd)
 {
@@ -347,10 +415,7 @@ int ds2480b_reset(int fd)
 		fprintf(stderr, "ds2480b_reset: error sending 1-Wire RESET to DS2480B\n");
 		return(-1);
 	}
-sleep(1);
-printf("before:\n");
 	n = ds2480b_recv(fd, tbuf, 1);
-printf("after\n");
 	if (tbuf[0] != 0xCD) {
 		fprintf(stderr, "ds2480b_reset: 1-Wire ");
 		n = (tbuf[0] & 0x03);
@@ -374,11 +439,9 @@ printf("after\n");
 }
 
 /*------------------------------------------------------------------------------
-
 	int ds2480b_readROM(fd, addr)
 
 	Read the ROM address of a single 1-Wire device on the bus and print it.
-
 ------------------------------------------------------------------------------*/
 int ds2480b_readROM(int fd, uint8_t *addr)
 {
@@ -414,12 +477,10 @@ int ds2480b_readROM(int fd, uint8_t *addr)
 }
 
 /*------------------------------------------------------------------------------
-
 	int ds2480b_recv(fd, tbuf, nbytes)
 
 	Receive a stream of bytes from the serial port. Returns the number of bytes
 	or -1 if there's an error.
-
 ------------------------------------------------------------------------------*/
 int ds2480b_recv(int fd, uint8_t *tbuf, int nbytes)
 {
@@ -439,11 +500,9 @@ int ds2480b_recv(int fd, uint8_t *tbuf, int nbytes)
 }
 
 /*------------------------------------------------------------------------------
-
 	int ds2480b_send(fd, data, nbytes)
 
 	Send a stream of bytes out the serial port. Returns -1 on error.
-
 ------------------------------------------------------------------------------*/
 int ds2480b_send(int fd, uint8_t *data, int nbytes)
 {
@@ -473,11 +532,9 @@ int ds2480b_send(int fd, uint8_t *data, int nbytes)
 }
 
 /*------------------------------------------------------------------------------
-
 	int ds2480b_skipROM(fd)
 
 	Sends the skip ROM command. Returns -1 on error.
-
 ------------------------------------------------------------------------------*/
 int ds2480b_skipROM(int fd)
 {
@@ -511,220 +568,49 @@ int ds2480b_skipROM(int fd)
 }
 
 /*------------------------------------------------------------------------------
+	ds2480b_searchROM(fd, directions, addr)
 
-	int ds18b20_convert(fd)
-
-	Send the convert command (0x44) to the DS18B20 sensor and read
-	back the reply (command echo) from the DS2480B bridge. Returns -1
-	on error. This includes the 750ms conversion time wait.
-
+	Retrieve the next 1-Wire device address. The directions array controls
+	the path taken when a discrepancy is noted. The directions array is
+	modified within this routine to reflect the response from the searchROM,
+	that is, it's equivalent to the response from the searchROM command but
+	packed in an easier-to-use format.
 ------------------------------------------------------------------------------*/
-int ds18b20_convert(int fd)
+void ds2480b_searchROM(int fd, uint8_t *directions, uint8_t *addr)
 {
 
-	uint8_t tbuf[3];
-	int n;
-	
+	uint8_t cmd[1], tbuf[16];
+
+	if (ds2480b_reset(fd) != 0) {
+		fprintf(stderr, "OWSearch: ds2480b_reset error\n");
+		exit(1);
+	}
+
 	ds2480b_mode(fd, DATAMODE);
-	tbuf[0] = CONVERT;
-	n = ds2480b_send(fd, tbuf, 1);
-	if (n == -1) {
-		fprintf(stderr, "ds18b20_convert: error sending convert command\n");
-		return(-1);
-	}
-	msleep(750);		// 12-bit conversion time
-	n = ds2480b_recv(fd, tbuf, 1);
-	if (n != 1) {
-		fprintf(stderr, "ds18b20_convert: error receiving convert command confirmation\n");
-		return(-1);
-	}
-	if (tbuf[0] != CONVERT) {
-		fprintf(stderr, "ds18b20_convert: read-back error from DS2480B\n");
-		return(-1);
-	}
-	return(0);
+	cmd[0] = SEARCHROM;			// Send the searchROM command
+	ds2480b_send(fd, cmd, 1);
+	ds2480b_recv(fd, cmd, 1);		// Receive searchROM command echo
+	ds2480b_mode(fd, COMMANDMODE);
+	cmd[0] = SEARCHACCON;			// Turn on the search accelerator
+	ds2480b_send(fd, cmd, 1);		// No reply expected
+	ds2480b_mode(fd, DATAMODE);
+	loadBuf(directions, tbuf);		// Create an output data buffer
+	ds2480b_send(fd, tbuf, 16);		// Send 16 output data bytes
+	ds2480b_recv(fd, tbuf, 16);		// Receive 16 reply data bytes
+	parse(directions, tbuf);		// Unpack the reply into the directions array
+	getROM(addr, tbuf);			// Unpack the ROM address found
+	ds2480b_mode(fd, COMMANDMODE);
+	cmd[0] = SEARCHACCOFF;			// Turn off the search accelerator
+	ds2480b_send(fd, cmd, 1);		// No reply expected
+	ds2480b_reset(fd);
 
 }
 
 /*------------------------------------------------------------------------------
+	getROM(romAddr, tbuf)
 
-	float ds18b20_readTemperature(fd)
-
-	Returns the floating point value. Do a CONVERT first.
-
+	Extracts the ROM address from a response array.
 ------------------------------------------------------------------------------*/
-float ds18b20_readTemperature(int fd)
-{
-
-	uint8_t i, n, tbuf[9];
-	int C;
-	float sign;
-
-	ds2480b_mode(fd, DATAMODE);
-	tbuf[0] = READSCRATCHPAD;
-	for (i = 1; i < 9; i++) {
-		tbuf[i] = 0xFF;
-	}
-	n = ds2480b_send(fd, tbuf, 9);
-	if (n == -1) {
-		fprintf(stderr, "ds2480b_readTemperature: error sending READSCRATCHPAD command\n");
-		return(-1);
-	}
-
-	n = ds2480b_recv(fd, tbuf, 9);
-	if (n == -1) {
-		fprintf(stderr, "ds2480b_readTemperature: error receiving scratchpad data\n");
-		return(-1);
-	}
-	C = tbuf[2];
-	C = C << 8;
-	C += tbuf[1];
-	// C = 0xFE6F;		// Test value -25.00
-	if (C & 0x8000) {
-		sign = -1.0;
-		C ^= 0xFFFF;
-	} else {
-		sign = 1.0;
-	}
-	return(sign * 0.0625 * (float) C);
-
-}
-
-void OWSearchX(int fd, uint8_t *addr)
-{
-
-	uint8_t i, id_bit_number, cmd[1], tbuf[16], response[16], romAddr[8];
-	int lastDiscrepancy;
-
-	if (ds2480b_reset(fd) != 0) {
-		fprintf(stderr, "OWSearch: ds2480b_reset error\n");
-		exit(1);
-	}
-
-	ds2480b_mode(fd, DATAMODE);
-	cmd[0] = SEARCHROM;			// Send the searchROM command
-	ds2480b_send(fd, cmd, 1);
-	ds2480b_recv(fd, cmd, 1);		// Receive command echo
-
-	ds2480b_mode(fd, COMMANDMODE);
-	cmd[0] = SEARCHACCON;			// Turn on the search accelerator
-	ds2480b_send(fd, cmd, 1);		// No reply from a Search acclerator command
-
-	for (i = 0; i < 16; i++) {
-		tbuf[i] = 0;
-	}
-lastDiscrepancy = 64;
-	do {
-		ds2480b_mode(fd, DATAMODE);
-		ds2480b_send(fd, tbuf, 16);		// Send 16 bytes
-		ds2480b_recv(fd, response, 16);		// Receive 16 bytes
-		printBits(response);
-		printf("Last discrepancy = %d\n", lastDiscrepancy = lastDiscrep(response));
-		getROM(romAddr, response);		// Unpack ROM address
-	} while (lastDiscrepancy < 63);
-
-}
-
-int OWSearch(int fd, int lastDiscrepancy, uint8_t *addr)
-{
-
-	uint8_t i, cmd[1], tbuf[16], response[16], romAddr[8];
-
-	if (ds2480b_reset(fd) != 0) {
-		fprintf(stderr, "OWSearch: ds2480b_reset error\n");
-		exit(1);
-	}
-printf("OWSearch: Reset ok\n");
-
-	ds2480b_mode(fd, DATAMODE);
-	cmd[0] = SEARCHROM;			// Send the searchROM command
-	ds2480b_send(fd, cmd, 1);
-	ds2480b_recv(fd, cmd, 1);		// Receive command echo
-printf("sent searchrom command\n");
-	ds2480b_mode(fd, COMMANDMODE);
-	cmd[0] = SEARCHACCON;			// Turn on the search accelerator
-	ds2480b_send(fd, cmd, 1);		// No reply from a Search acclerator command
-printf("sent search accelerator command\n");
-	setDirectionBit(lastDiscrepancy, tbuf);
-printf("here's tbuf\n");
-printBits(tbuf);
-	ds2480b_mode(fd, DATAMODE);
-printf("set datamode\n");
-	ds2480b_send(fd, tbuf, 16);		// Send 16 bytes
-	ds2480b_recv(fd, response, 16);		// Receive 16 bytes
-	ds2480b_mode(fd, COMMANDMODE);
-	cmd[0] = SEARCHACCOFF;
-	ds2480b_send(fd, cmd, 1);		// No reply from a Search accelerator command
-	printBits(response);
-	printf("Last discrepancy = %d\n", lastDiscrepancy = lastDiscrep(response));
-	getROM(romAddr, response);		// Unpack ROM address
-printf("printed ROM address\n");
-	ds2480b_reset(fd);
-	return(lastDiscrepancy);
-
-}
-
-void setDirectionBit(int lastDiscrepancy, uint8_t *tbuf)
-{
-
-	int i, byte, shiftAmt;
-
-	for (i = 0; i < 16; i++) {
-		tbuf[i] = 0;
-	}
-	if (lastDiscrepancy < 0) {
-		return;
-	}
-	byte = lastDiscrepancy / 4;
-	shiftAmt = lastDiscrepancy % 4;
-	tbuf[byte] += (0x03 << shiftAmt);
-
-}
-
-void printBits(uint8_t *tbuf)
-{
-
-	int i, j, k;
-	uint8_t tmp;
-
-	printf("MSB to LSB order\n");
-	for (i = 0; i < 16; i++) {
-		tmp = tbuf[15-i];
-		for (j = 0; j < 8; j++) {
-			k = (tmp & 0x80) ? 1 : 0;
-			printf("%d", k);
-			tmp <<= 1;
-		}
-		printf(" ");
-	}
-	printf("\n");
-
-}
-
-int lastDiscrep(uint8_t *tbuf)
-{
-
-	uint8_t tmp;
-	int i, j, discrepBit, returnbit, abit, last;
-
-	printf("\nDiscrepancies");
-
-	for (i = 0; i < 16; i++) {
-		tmp = tbuf[i];
-		printf("\nByte %02d ", i);
-		for (j = 0; j < 8; j+=2) {
-			discrepBit = ((tmp >> j) & 0x01) ? 1 : 0;
-			returnbit = ((tmp >> (j+1)) & 0x01) ? 1 : 0;
-			abit = (i*8+j)/2;
-			if (discrepBit) last = abit;
-			printf("Bit%d(%03d):%d,%d  ", j, abit, returnbit, discrepBit);
-		}
-	}
-	printf("\n");
-	return(last);
-
-}
-
 void getROM(uint8_t *romAddr, uint8_t *tbuf)
 {
 
@@ -734,14 +620,157 @@ void getROM(uint8_t *romAddr, uint8_t *tbuf)
 		romAddr[i/2] = twoIntoOne(&tbuf[i]);
 	}
 
-	printf("romAddr (LSB to MSB):\n");
-	for (i = 0; i < 8; i++) {
-		printf("%02X ", romAddr[i]);
+}
+
+/*------------------------------------------------------------------------------
+	lastDiscrep(directions)
+
+	Scans the directions array from high to low to find the last discrepancy
+	idBit position.
+------------------------------------------------------------------------------*/
+int lastDiscrep(uint8_t *directions)
+{
+
+	int i;
+
+	for (i = 63; i; i--) {
+		if (directions[i] == 0x01) {
+			break;
+		}
+	}
+	return(i);
+
+}
+
+/*------------------------------------------------------------------------------
+	loadBuf(directions, tbuf)
+
+	Creates a searchROM output data array from the directions array.
+------------------------------------------------------------------------------*/
+void loadBuf(uint8_t *directions, uint8_t *tbuf)
+{
+
+	int i, j, idBit;
+
+	idBit = 0;
+	for (i = 0; i < 16; i++) {
+		for (j = 0; j < 4; j++) {
+			tbuf[i] >>= 2;
+			tbuf[i] |= (directions[idBit] << 6);
+			idBit++;
+		}
+	}
+
+}
+
+/*------------------------------------------------------------------------------
+	parse(directions, response)
+
+	Takes the response from a searchROM command and creates the directions
+	array. The directions array then contains the 2-bits of information for
+	each idBit.
+------------------------------------------------------------------------------*/
+void parse(uint8_t *directions, uint8_t *response)
+{
+
+	
+	uint8_t tmp;
+	int i, j, idBit;
+
+	idBit = 0;
+	for (i = 0; i < 16; i++) {
+		tmp = response[i];
+		for (j = 0; j < 8; j+=2) {
+			directions[idBit] = ((tmp >> j) & 0x03);
+			idBit++;
+		}
+	}
+}
+
+/*------------------------------------------------------------------------------
+	prArray(array)
+
+	Prints the 16-byte output data and response array (for debugging).
+------------------------------------------------------------------------------*/
+void prArray(uint8_t *array)
+{
+
+	uint8_t tmp;
+	int i, j, r, d, abit;
+
+	for (i = 0; i < 16; i++) {
+		printf("\n");
+		tmp = array[i];
+		for (j = 0; j < 8; j+=2) {
+			d = ((tmp >> j) & 0x01) ? 1 : 0;
+			r = ((tmp >> (j+1)) & 0x01) ? 1: 0;
+			abit = (i*8+j)/2;
+			printf("(%03d):%d,%d ", abit, r, d);
+		}
+	}
+}
+
+/*------------------------------------------------------------------------------
+		prParsed(array)
+
+		Prints the directions array (for debugging).
+------------------------------------------------------------------------------*/
+void prParsed(uint8_t *array)
+{
+
+	int i, r, d;
+
+	for (i = 0; i < 64; i++) {
+		if (!(i%8)) {
+			printf("\n");
+		}
+		r = (array[i] & 0x02) ? 1 : 0;
+		d = (array[i] & 0x01) ? 1 : 0;
+//		printf("B%02d:(%02X) ", i, array[i]);
+		printf("B%02d:(%01X%01X) ", i, r, d);
 	}
 	printf("\n");
 
 }
 
+/*------------------------------------------------------------------------------
+	prROM(addr)
+
+	Prints a ROM address.
+------------------------------------------------------------------------------*/
+void prROM(uint8_t *addr)
+{
+
+	int i;
+
+	for (i = 0; i < 8; i++) {
+		printf("%02X ", addr[i]);
+	}
+	printf("\n");
+}
+
+/*------------------------------------------------------------------------------
+	setDirectionBit(lastDiscrepancy, directions)
+
+	Modifies the directions array to put a (1,1) into the last
+	discrepancy position and zeroes out higher idBit positions.
+------------------------------------------------------------------------------*/
+void setDirectionBit(int lastDiscrepancy, uint8_t *directions)
+{
+
+	int i;
+
+	directions[lastDiscrepancy] = 0x03;
+	for (i = lastDiscrepancy + 1; i < 64; i++) {
+		directions[i] = 0x00;
+	}
+
+}
+/*------------------------------------------------------------------------------
+	twoIntoOne(pair)
+
+	Helper routine for getROM
+------------------------------------------------------------------------------*/
 uint8_t twoIntoOne(uint8_t *pair)
 {
 
@@ -757,3 +786,6 @@ uint8_t twoIntoOne(uint8_t *pair)
 	}
 	return(temp);
 }
+
+/*------------------------------------------------------------------------------
+------------------------------------------------------------------------------*/
