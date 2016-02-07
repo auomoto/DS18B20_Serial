@@ -5,36 +5,30 @@
 #include <termios.h>
 #include <unistd.h>
 
-#define DEFAULTSERIAL	"/dev/ttyS2"		// For Cygwin, Raspberry PI
+#define DEFAULTSERIAL	"/dev/ttyS2"
 #define	msleep(t)	usleep(1000*t)		// Milliseconds sleep
 
 // DS2480B
-#define COMMANDMODE	0xE3
-#define DATAMODE	0xE1
+#define COMMANDMODE		0xE3
+#define DATAMODE		0xE1
 #define RESETCOMMAND	0xC5			// DS2480B flex speed reset
-#define SEARCHACCOFF	0xA1			// Search accelerator off
-#define	SEARCHACCON	0xB1			// Search accelerator on
-#define TIMINGBYTE	0xC1
+#define SEARCHACCOFF	0xA1			// Search accelerator off command
+#define	SEARCHACCON		0xB1			// Search accelerator on command
+#define TIMINGBYTE		0xC1
 
 // 1-Wire
-#define MATCHROM	0x55
-#define MAXDEVICES	25
-#define READROM		0x33
-#define	SEARCHROM	0xF0
-#define SKIPROM		0xCC
+#define MATCHROM		0x55
+#define MAXDEVICES		25
+#define READROM			0x33
+#define	SEARCHROM		0xF0
+#define SKIPROM			0xCC
 
 // DS18B20
-#define CONVERT		0x44
+#define CONVERT			0x44
 #define READSCRATCHPAD	0xBE
-
-// MISC
-#define TRUE		1
-#define FALSE		0
 
 // Globals
 uint8_t currentMode;
-uint8_t nDevices;				// Number of devices found in a SearchROM
-int lastDeviceFlag;				// Flag indicating search found the last device
 
 // Function Prototypes
 int ds18b20_convert(int);
@@ -45,18 +39,19 @@ int ds2480b_mode(int, uint8_t);
 int ds2480b_readROM(int, uint8_t*);
 int ds2480b_recv(int, uint8_t*, int);
 int ds2480b_reset(int);
+void ds2480b_searchROM(int, uint8_t*, uint8_t*);
 int ds2480b_send(int, uint8_t*, int);
 int ds2480b_skipROM(int);
 void getROM(uint8_t*, uint8_t*);
 int initialize(int, char**);
-int main(int, char**);
 int lastDiscrep(uint8_t*);
 void loadBuf(uint8_t*, uint8_t*);
+int main(int, char**);
 void parse(uint8_t*, uint8_t*);
 void prArray(uint8_t*);
 void prParsed(uint8_t*);
 void prROM(uint8_t*);
-void ds2480b_searchROM(int, uint8_t*, uint8_t*);
+int scanBus(int, uint8_t[][8]);
 void serialBreak(int);
 int serialInit(char*);
 void setDirectionBit(int, uint8_t*);
@@ -65,49 +60,29 @@ uint8_t twoIntoOne(uint8_t*);
 int main(int argc, char *argv[])
 {
 
-	uint8_t addr[8], directions[64], romAddresses[MAXDEVICES][8];
-	int i, j, nDevices, fd, lastDiscrepancy, currentTime;
+	uint8_t romAddresses[MAXDEVICES][8];
+	int i, j, fd, nDevices, currentTime;
 	float Celsius, Fahrenheit;
 
-	fd = initialize(argc, argv);	// Open the DS2480B serial port
-	lastDiscrepancy = -1;
-	nDevices = 0;
-	for (i = 0; i < 64; i++) {
-		directions[i] = 0;
-	}
-	while (lastDiscrepancy) {
-		ds2480b_searchROM(fd, directions, addr);
-		for (i = 0; i < 8; i++) {
-			romAddresses[nDevices][i] = addr[i];
-		}
-		lastDiscrepancy = lastDiscrep(directions);
-		setDirectionBit(lastDiscrepancy, directions);
-		nDevices++;
-	}
-	printf("nDevices = %d\n", nDevices);
-	for (i = 0; i < nDevices; i++) {
-		prROM(romAddresses[i]);
-	}
+	fd = initialize(argc, argv);			// Open the DS2480B serial port
+	nDevices = scanBus(fd, romAddresses);
 	for (;;) {
-		printf("---\n");
-		ds2480b_skipROM(fd);
-		currentTime = (int) time(NULL);	// POSIX time (no leap seconds)
-		ds18b20_convert(fd);			// Get temperature reading
+		ds2480b_skipROM(fd);				// Address all sensors
+		currentTime = (int) time(NULL);		// POSIX time (no leap seconds)
+		ds18b20_convert(fd);				// All sensors A/D conversion to temperature
 		for (i = 0; i < nDevices; i++) {
-			for (j = 0; j < 8; j++) {
-				addr[j] = romAddresses[i][j];
+			if (romAddresses[i][0] == 0x28) {	// 0x28 is the DS18B20 device family
+				ds2480b_matchROM(fd, romAddresses[i]);
+				Celsius = ds18b20_readTemperature(fd);
+				Fahrenheit = 32.0 + 9.0 * Celsius / 5.0;
+				printf("%d %6.2f %5.1f [ ", currentTime, Celsius, Fahrenheit);
+				for (j = 0; j < 8; j++) {
+					printf("%02X ", romAddresses[i][j]);
+				}
+				printf("]\n");
+				fflush(stdout);
 			}
-			ds2480b_matchROM(fd, addr);
-			Celsius = ds18b20_readTemperature(fd);
-			Fahrenheit = 32.0 + 9.0 * Celsius / 5.0;
-			printf("%d %6.2f %5.1f [ ", currentTime, Celsius, Fahrenheit);
-			for (j = 0; j < 8; j++) {
-				printf("%02X ", addr[j]);
-			}
-			printf("]\n");
-			fflush(stdout);
 		}
-//		sleep(1);
 	}
 	return(0);
 
@@ -140,6 +115,38 @@ int initialize(int argc, char *argv[])
 	}
 	return(fd);
 
+}
+
+/*------------------------------------------------------------------------------
+	int scanBus(fd, romAddresses)
+
+	Scans the 1-Wire bus and puts the addresses into romAddress. Returns the
+	number of devices found on the bus.
+------------------------------------------------------------------------------*/
+int scanBus(int fd, uint8_t romAddresses[][8])
+{
+
+	uint8_t directions[64], addr[8];
+	int i, lastDiscrepancy, nDevices;
+	
+	for (i = 0; i < 64; i++) {
+		directions[i] = 0x00;
+	}
+	lastDiscrepancy = -1;
+	nDevices = 0;
+	while (lastDiscrepancy) {
+		ds2480b_searchROM(fd, directions, addr);
+		for (i = 0; i < 8; i++) {
+			romAddresses[nDevices][i] = addr[i];
+		}
+		lastDiscrepancy = lastDiscrep(directions);
+		setDirectionBit(lastDiscrepancy, directions);
+		nDevices++;
+		if (nDevices == MAXDEVICES) {
+			break;
+		}
+	}
+	return(nDevices);
 }
 
 /*------------------------------------------------------------------------------
@@ -186,6 +193,7 @@ void serialBreak(int fd)
 
 }
 
+/* BEGIN DS18B20 =============================================================*/
 /*------------------------------------------------------------------------------
 	int ds18b20_convert(fd)
 
@@ -261,7 +269,11 @@ float ds18b20_readTemperature(int fd)
 	return(sign * 0.0625 * (float) C);
 
 }
+/* END DS18B20 ===============================================================*/
 
+
+
+/* BEGIN DS2480B =============================================================*/
 /*------------------------------------------------------------------------------
 	ds2480b_detect(fd)
 
@@ -587,7 +599,7 @@ void ds2480b_searchROM(int fd, uint8_t *directions, uint8_t *addr)
 	}
 
 	ds2480b_mode(fd, DATAMODE);
-	cmd[0] = SEARCHROM;			// Send the searchROM command
+	cmd[0] = SEARCHROM;				// Send the searchROM command
 	ds2480b_send(fd, cmd, 1);
 	ds2480b_recv(fd, cmd, 1);		// Receive searchROM command echo
 	ds2480b_mode(fd, COMMANDMODE);
@@ -598,7 +610,7 @@ void ds2480b_searchROM(int fd, uint8_t *directions, uint8_t *addr)
 	ds2480b_send(fd, tbuf, 16);		// Send 16 output data bytes
 	ds2480b_recv(fd, tbuf, 16);		// Receive 16 reply data bytes
 	parse(directions, tbuf);		// Unpack the reply into the directions array
-	getROM(addr, tbuf);			// Unpack the ROM address found
+	getROM(addr, tbuf);				// Unpack the ROM address found
 	ds2480b_mode(fd, COMMANDMODE);
 	cmd[0] = SEARCHACCOFF;			// Turn off the search accelerator
 	ds2480b_send(fd, cmd, 1);		// No reply expected
@@ -786,6 +798,7 @@ uint8_t twoIntoOne(uint8_t *pair)
 	}
 	return(temp);
 }
+/* END DS2480B ===============================================================*/
 
 /*------------------------------------------------------------------------------
 ------------------------------------------------------------------------------*/
