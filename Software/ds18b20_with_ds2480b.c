@@ -32,7 +32,8 @@
 #define DATAMODE		0xE1
 #define RESETCOMMAND	0xC5			// DS2480B flex speed reset
 #define SEARCHACCOFF	0xA1			// Search accelerator off command
-#define	SEARCHACCON		0xB1			// Search accelerator on command
+//#define	SEARCHACCON		0xB1			// Search accelerator on command, regular speed
+#define	SEARCHACCON		0xB5			// Search accelerator on command, flex speed
 #define TIMINGBYTE		0xC1
 
 // 1-Wire
@@ -111,7 +112,7 @@ int main(int argc, char *argv[])
 				ds2480b_matchROM(fd, romAddresses[i]);
 				Celsius = ds18b20_readTemperature(fd);
 				Fahrenheit = 32.0 + 9.0 * Celsius / 5.0;
-				printf("%d %9.5f %5.1f [ ", currentTime, Celsius, Fahrenheit);
+				printf("%d %7.2f %5.1f [ ", currentTime, Celsius, Fahrenheit);
 				prROM(romAddresses[i]);
 				printf("]\n");
 				fflush(stdout);
@@ -311,28 +312,28 @@ float ds18b20_readTemperature(int fd)
 /*------------------------------------------------------------------------------
 	ds2480b_detect(fd)
 
-	Sets up the DS2480B timing and pulses. Leaves it in Command mode.
+	Sets up the DS2480B timing and pulses. Leaves it in Command mode.  See
+	the DS2480B data sheet for the commands and responses. We're using flex
+	speed so the single-bit response is 0x97.
 
-	The last byte in the response is supposed to be 93 but it sometimes
-	comes back as 90. The explanation in AN192 suggests that the discrepancy
-	is due to unsolicited presence pulses although that doesn't jibe with
-	Maxim demonstration code found on the web.
+	Maxim application note 132 "Quick Guide to 1-Wire Net Using PCs and
+	Microcontrollers" has more info on long runs (see p. 4, 0-200m cables).
 ------------------------------------------------------------------------------*/
 int ds2480b_detect(fd)
 {
 
-	uint8_t i, n, tbuf[5], response[] = {0x16, 0x44, 0x5A, 0x00, 0x93};
+	uint8_t i, n, tbuf[5], response[] = {0x16, 0x44, 0x5A, 0x00, 0x97};
 
-	serialBreak(fd);			// Break resets the DS2480B
+	serialBreak(fd);		// Break resets the DS2480B
 	tbuf[0] = TIMINGBYTE;
 	ds2480b_send(fd, tbuf, 1);	// Send the timing byte
 
-								// Pulse shaping & detect: See p4 & p5 of AN192
-	tbuf[0] = 0x17;				// Pull-down slew rate (PDSRC) 1.37V/us
-	tbuf[1] = 0x45;				// Write-low time 10 us (W1LT or W1LD)
-	tbuf[2] = 0x5B;				// DSO/WORT 8 us
-	tbuf[3] = 0x0F;				// Read baud rate register command request
-	tbuf[4] = 0x91;				// 1-Wire bit
+					// Pulse shaping & detect: See p4 & p5 of AN192
+	tbuf[0] = 0x17;			// Pull-down slew rate (PDSRC) 1.37V/us
+	tbuf[1] = 0x45;			// Write-low time 10 us (W1LT or W1LD)
+	tbuf[2] = 0x5B;			// Data sample offset (DSO)/Write 0 Recovery Time (W0RT) 8us
+	tbuf[3] = 0x0F;			// Read baud rate register command request
+	tbuf[4] = 0x95;			// 1-Wire single bit flex speed response
 
 	// Send the commands
 	n = ds2480b_send(fd, tbuf, 5);
@@ -351,17 +352,9 @@ int ds2480b_detect(fd)
 	// Check the response
 	for (i = 0; i < 5; i++) {
 		if (tbuf[i] != response[i]) {
-			if (i < 4) {
-				fprintf(stderr, "ds2480b_detect: bad response packet\n");
-				fprintf(stderr, "tbuf[%d] = %02X should be %02X\n", i, tbuf[i], response[i]);
-				return(-1);
-			} else {
-				if (tbuf[i] != 0x90) {		// 0x90 is OK (AN192 p4)
-					fprintf(stderr, "ds2480b_detect: bad response packet\n");
-					fprintf(stderr, "tbuf[%d] = %02X should be 0x90 or 0x93\n", i, tbuf[i]);
-					return(-1);
-				}
-			}
+			fprintf(stderr, "ds2480b_detect: bad response packet\n");
+			fprintf(stderr, "tbuf[%d] = %02X should be %02X\n", i, tbuf[i], response[i]);
+			return(-1);
 		}
 	}
 	currentMode = COMMANDMODE;
