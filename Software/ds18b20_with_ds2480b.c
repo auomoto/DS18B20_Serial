@@ -8,12 +8,16 @@
 	The DS2480B data sheet and the Maxim Application Note 192 have information
 	on how to use this device.
 
-	This program is known to compile with gcc but should work with any POSIX.
+	This program is known to compile with gcc but should work with any POSIX system.
 	The development environment is Cygwin on Windows 10 or Debian on a Raspberry PI.
 	
 	$ cc ds18b20_with_ds2480b.c
 	$ ./a.exe /dev/ttyS2
 
+	Command line options
+		-p Print the line driver parameters and exit
+		-a Print the 1-Wire ROM addresses and exit
+	
 */
 	
 #include <stdio.h>
@@ -32,7 +36,6 @@
 #define DATAMODE		0xE1
 #define RESETCOMMAND	0xC5			// DS2480B flex speed reset
 #define SEARCHACCOFF	0xA1			// Search accelerator off command
-//#define	SEARCHACCON		0xB1			// Search accelerator on command, regular speed
 #define	SEARCHACCON		0xB5			// Search accelerator on command, flex speed
 #define TIMINGBYTE		0xC1
 
@@ -58,6 +61,7 @@ float ds18b20_readTemperature(int);
 int ds2480b_detect(int);
 int ds2480b_matchROM(int, uint8_t*);
 int ds2480b_mode(int, uint8_t);
+void ds2480b_parameters(int);
 int ds2480b_readROM(int, uint8_t*);
 int ds2480b_recv(int, uint8_t*, int);
 int ds2480b_reset(int);
@@ -106,13 +110,13 @@ int main(int argc, char *argv[])
 	for (;;) {									// Loop forever, reading and printing temperatures
 		ds2480b_skipROM(fd);					// Address all sensors
 		currentTime = (int) time(NULL);			// POSIX time (no leap seconds)
-		ds18b20_convert(fd);					// Ask all sensors to save temperature
+		ds18b20_convert(fd);					// Ask all sensors record the temperature
 		for (i = 0; i < nDevices; i++) {
 			if (romAddresses[i][0] == 0x28) {	// 0x28 is the DS18B20 device family
 				ds2480b_matchROM(fd, romAddresses[i]);
 				Celsius = ds18b20_readTemperature(fd);
 				Fahrenheit = 32.0 + 9.0 * Celsius / 5.0;
-				printf("%d %7.2f %5.1f [ ", currentTime, Celsius, Fahrenheit);
+				printf("%d %6.2f %5.1f [ ", currentTime, Celsius, Fahrenheit);
 				prROM(romAddresses[i]);
 				printf("]\n");
 				fflush(stdout);
@@ -137,20 +141,46 @@ int initialize(int argc, char *argv[])
 {
 
 	char portName[25];
-	int i, fd;
+	uint8_t romAddresses[MAXDEVICES][8];
+	int i, n, fd, printParams = 0, printROM = 0;
 
 	strcpy(portName, DEFAULTSERIAL);
 	for (i = 1; i < argc; i++) {
-		if (argv[i][0] == '/') {
+		if (argv[1][0] == '/') {
 			strcpy(portName, argv[i]);
-		}	
+		} else if (argv[i][0] == '-') {
+			switch (argv[i][1]) {
+				case ('p'):
+					printParams = 1;
+					break;
+				case ('a'):
+					printROM = 1;
+					break;
+			default:
+				break;
+			}
+		}
 	}
 	fd = serialInit(portName);	// Open the serial port
 	if (ds2480b_detect(fd) == -1) {
 		return(-1);
 	}
-	return(fd);
 
+	if (printParams) {
+		ds2480b_parameters(fd);
+	}
+	if (printROM) {
+		n = scanBus(fd, romAddresses);
+		for (i = 0; i < n; i++) {
+			prROM(romAddresses[i]);
+			printf("\n");
+		}
+	}	
+	if (printParams || printROM) {
+		exit(0);
+	} else {
+		return(fd);
+	}
 }
 
 /*------------------------------------------------------------------------------
@@ -258,7 +288,7 @@ int ds18b20_convert(int fd)
 	}
 	msleep(750);		// 12-bit conversion time
 	n = ds2480b_recv(fd, tbuf, 1);
-	if (n != 1) {
+	if (n != 0) {
 		fprintf(stderr, "ds18b20_convert: error receiving convert command confirmation\n");
 		return(-1);
 	}
@@ -314,7 +344,8 @@ float ds18b20_readTemperature(int fd)
 
 	Sets up the DS2480B timing and pulses. Leaves it in Command mode.  See
 	the DS2480B data sheet for the commands and responses. We're using flex
-	speed so the single-bit response is 0x97.
+	speed so the single-bit response is 0x97. Sometimes this comes back as
+	0x94.
 
 	Maxim application note 132 "Quick Guide to 1-Wire Net Using PCs and
 	Microcontrollers" has more info on long runs (see p. 4, 0-200m cables).
@@ -328,12 +359,12 @@ int ds2480b_detect(fd)
 	tbuf[0] = TIMINGBYTE;
 	ds2480b_send(fd, tbuf, 1);	// Send the timing byte
 
-					// Pulse shaping & detect: See p4 & p5 of AN192
+	// Pulse shaping & detect: See p4 & p5 of AN192
 	tbuf[0] = 0x17;			// Pull-down slew rate (PDSRC) 1.37V/us
 	tbuf[1] = 0x45;			// Write-low time 10 us (W1LT or W1LD)
 	tbuf[2] = 0x5B;			// Data sample offset (DSO)/Write 0 Recovery Time (W0RT) 8us
 	tbuf[3] = 0x0F;			// Read baud rate register command request
-	tbuf[4] = 0x95;			// 1-Wire single bit flex speed response
+	tbuf[4] = 0x95;			// 1-Wire single bit flex speed
 
 	// Send the commands
 	n = ds2480b_send(fd, tbuf, 5);
@@ -352,11 +383,16 @@ int ds2480b_detect(fd)
 	// Check the response
 	for (i = 0; i < 5; i++) {
 		if (tbuf[i] != response[i]) {
-			fprintf(stderr, "ds2480b_detect: bad response packet\n");
-			fprintf(stderr, "tbuf[%d] = %02X should be %02X\n", i, tbuf[i], response[i]);
-			return(-1);
+			if ((i == 4) && (tbuf[i] == 0x94)) {
+				break;
+			} else {
+				fprintf(stderr, "ds2480b_detect: inconsistent response packet\n");
+				fprintf(stderr, "tbuf[%d] = %02X, expected %02X\n", i, tbuf[i], response[i]);
+				return(-1);
+			}
 		}
 	}
+
 	currentMode = COMMANDMODE;
 	return(0);
 
@@ -421,6 +457,76 @@ int ds2480b_mode(int fd, uint8_t mode)
 	currentMode = mode;
 	return(0);
 
+}
+/*------------------------------------------------------------------------------
+	ds2480b_parameters{fd)
+	
+	Print the network parameters.
+	
+	PDSRC	 	V/us Pulldown Slew Rate Control
+	PPD			us Programming Pulse Duration
+	SPUD		ms Strong Pullup Duration
+	W1LT		us Write-1 Low Time
+	DSO/W0RT	us Data Sample Offset and Write 0 Recovery Time
+	LOAD		mA Load Sensor Threshold
+	Baud Rate	kbps (negative swaps RX/TX)
+------------------------------------------------------------------------------*/
+void ds2480b_parameters(int fd)
+{
+
+	uint8_t cmd[1], response[1];
+	int n, paramCode, valueCode;
+	float paramRef[8][8] = {
+		{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},					// There's no 000 parameter
+		{15.0, 2.2, 1.65, 1.37, 1.1, 0.83, 0.7, 0.55},				// V/us PDSRC
+		{32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 9999.0},	// us PPD
+		{16.4, 65.5, 131.0, 262.0, 524.0, 1048.0, -1.0, 9999.0}, 	// ms SPUD	
+		{8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0},				// us W1LT
+		{3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0},					// us DSO/W0RT
+		{1.8, 2.1, 2.4, 2.7, 3.0, 3.3, 3.6, 3.9},					// mA LOAD
+		{9.6, 19.2, 57.6, 115.2, -9.6, -19.2, -57.6, -115.2}		// kbps Baud rate			
+	};
+
+	ds2480b_mode(fd, COMMANDMODE);
+	for (paramCode = 1; paramCode < 8; paramCode++) {
+		cmd[0] = (paramCode << 1) + 1;
+		n = ds2480b_send(fd, cmd, 1);
+		if (n != 0) {
+			fprintf(stderr, "ds2480b_parameters: send command failed %d\n", n);
+			return;
+		}
+		n = ds2480b_recv(fd, response, 1);
+		if (n != 0) {
+			fprintf(stderr, "ds2480b_parameters: recv command failed\n");
+			return;
+		}
+		valueCode = (response[0] >> 1);
+		switch(paramCode) {
+			case (1):	printf("Pull-Down Slew Rate Control (PDSRC)");
+						printf(" = %5.2f V/us\n", paramRef[paramCode][valueCode]);
+						break;
+			case (2):	printf("Programming Pulse Duration (PPD)");
+						printf(" = %5d us\n", (int) paramRef[paramCode][valueCode]);
+						break;
+			case (3):	printf("Strong Pullup Duration (SPUD)");
+						printf(" = %4.1f ms\n", paramRef[paramCode][valueCode]);
+						break;
+			case (4):	printf("Write-1 Low Time (W1LT)");
+						printf(" = %2d ms\n", (int) paramRef[paramCode][valueCode]);
+						break;
+			case (5):	printf("Data Sample Offset/Write 0 Recovery Time (DSO/W0RT)");
+						printf(" = %2d us\n", (int) paramRef[paramCode][valueCode]);
+						break;
+			case (6):	printf("Load Sensor Threshold (LOAD)");
+						printf(" = %3.1f mA\n", paramRef[paramCode][valueCode]);
+						break;
+			case (7):	printf("RS232 Baud Rate (RBR)");
+						printf(" = %6.1f kbits/s\n", paramRef[paramCode][valueCode]);
+						break;
+			default:
+						break;
+		}
+	}
 }
 
 /*------------------------------------------------------------------------------
@@ -536,7 +642,7 @@ int ds2480b_recv(int fd, uint8_t *tbuf, int nbytes)
 		return(-1);
 	}
 	tcflush(fd, TCIOFLUSH);			// flush read and write data
-	return(n);
+	return(0);
 
 }
 
@@ -607,7 +713,7 @@ int ds2480b_skipROM(int fd)
 		return(-1);
 	}
 	n = ds2480b_recv(fd, tbuf, 1);
-	if (n != 1) {
+	if (n != 0) {
 		fprintf(stderr, "ds2480b_skipROM: error reported from ds2480b_recv\n");
 		return(-1);
 	}
